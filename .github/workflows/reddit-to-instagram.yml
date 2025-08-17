@@ -2,18 +2,28 @@ name: Reddit → Instagram (daily)
 
 on:
   schedule:
-    - cron: "30 13 * * *"   # 13:30 UTC = 19:00 IST, runs daily
-  workflow_dispatch:         # allow manual runs from the Actions tab
+    # 21:00 IST = 15:30 UTC
+    - cron: "30 15 * * *"
+  workflow_dispatch:  # manual runs from the Actions tab
 
 permissions:
-  contents: write            # needed to commit updated posted_history.json
+  contents: write  # to commit posted_history.json (state)
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata   # makes Python/log timestamps use IST
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+
+      - name: Set runner timezone to IST (best-effort)
+        run: |
+          echo "TZ=Asia/Kolkata" >> "$GITHUB_ENV"
+          (sudo timedatectl set-timezone "Asia/Kolkata" || sudo ln -snf /usr/share/zoneinfo/Asia/Kolkata /etc/localtime) || true
+          date  # should print IST time
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,12 +35,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore last posted_history.json so we don't repost
-      - name: Restore history file (if present)
+      # Ensure history file exists so we don't repost
+      - name: Restore history file (if missing)
         run: |
-          if [ ! -f posted_history.json ]; then
-            echo "[]"> posted_history.json
-          fi
+          test -f posted_history.json || echo "[]" > posted_history.json
 
       - name: Run bot
         env:
@@ -42,22 +50,18 @@ jobs:
           FB_APP_SECRET: ${{ secrets.FB_APP_SECRET }}
         run: |
           python reddit_to_instagram.py
-          echo "== Listing logs =="
+          echo "== Logs =="
           ls -la logs || true
 
-      # Upload logs so you can read them from the Actions UI
-      - name: Upload logs artifact
+      - name: Upload logs (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-logs
           path: logs/
 
-      # Commit updated history back to the repo (so state persists across runs)
-      - name: Commit posted_history.json if changed
+      - name: Commit updated history (and optional logs)
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: update posted_history.json (auto)"
-          file_pattern: posted_history.json logs/run_*.log
-          commit_options: "--no-verify"
-          add_options: "-A"
+          file_pattern: posted_history.json
