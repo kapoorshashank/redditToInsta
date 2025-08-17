@@ -1,0 +1,63 @@
+name: Reddit → Instagram (daily)
+
+on:
+  schedule:
+    - cron: "30 13 * * *"   # 13:30 UTC = 19:00 IST, runs daily
+  workflow_dispatch:         # allow manual runs from the Actions tab
+
+permissions:
+  contents: write            # needed to commit updated posted_history.json
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Restore last posted_history.json so we don't repost
+      - name: Restore history file (if present)
+        run: |
+          if [ ! -f posted_history.json ]; then
+            echo "[]"> posted_history.json
+          fi
+
+      - name: Run bot
+        env:
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          SUBREDDIT: ${{ secrets.SUBREDDIT }}
+          REDDIT_LIMIT: ${{ secrets.REDDIT_LIMIT }}
+          FB_APP_ID: ${{ secrets.FB_APP_ID }}
+          FB_APP_SECRET: ${{ secrets.FB_APP_SECRET }}
+        run: |
+          python reddit_to_instagram.py
+          echo "== Listing logs =="
+          ls -la logs || true
+
+      # Upload logs so you can read them from the Actions UI
+      - name: Upload logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-logs
+          path: logs/
+
+      # Commit updated history back to the repo (so state persists across runs)
+      - name: Commit posted_history.json if changed
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update posted_history.json (auto)"
+          file_pattern: posted_history.json logs/run_*.log
+          commit_options: "--no-verify"
+          add_options: "-A"
