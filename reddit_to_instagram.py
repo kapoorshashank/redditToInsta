@@ -21,9 +21,18 @@ from typing import List, Dict
 from datetime import datetime
 
 import requests
+import re
+from html import unescape
+from xml.etree import ElementTree as ET
+
 
 # ── Base directory (folder where this .py lives) ──────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# ---- Reddit UA (more "real" to avoid CI blocks) ----
+REDDIT_UA = os.getenv(
+    "REDDIT_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RedditToInstaBot/1.0 (+https://github.com/<youruser>/<yourrepo>)"
+)
 
 # Paths pinned to script folder (Task Scheduler-safe)
 LOG_DIR = os.path.join(BASE_DIR, "logs")
@@ -141,6 +150,76 @@ def get_with_backoff(url: str, params: dict, timeout: int = 30, max_retries: int
         log_usage_headers(r, "GET ")
         raise RuntimeError(f"Graph error {r.status_code}: {r.text}")
     raise RuntimeError("Graph: max retries reached")
+def _http_get(url: str, headers: dict, timeout: int = 20):
+    r = requests.get(url, headers=headers, timeout=timeout)
+    # Treat 403 specially so we can fall back
+    if r.status_code == 403:
+        raise requests.HTTPError("403", response=r)
+    r.raise_for_status()
+    return r
+
+def fetch_hot_json_primary(sub: str, limit: int) -> dict:
+    url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
+    headers = {"User-Agent": REDDIT_UA, "Accept": "application/json"}
+    return _http_get(url, headers).json()
+
+def fetch_hot_json_old(sub: str, limit: int) -> dict:
+    url = f"https://old.reddit.com/r/{sub}/hot.json?limit={limit}"
+    headers = {"User-Agent": REDDIT_UA, "Accept": "application/json"}
+    return _http_get(url, headers).json()
+
+def fetch_hot_rss(sub: str, limit: int) -> list[dict]:
+    """
+    Last-resort: parse the RSS feed and extract i.redd.it images.
+    We won't have scores; we’ll keep the original feed order.
+    """
+    url = f"https://www.reddit.com/r/{sub}/hot/.rss"
+    headers = {"User-Agent": REDDIT_UA, "Accept": "application/rss+xml"}
+    text = _http_get(url, headers).text
+    root = ET.fromstring(text)
+    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+    items = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        permalink = (item.findtext("link") or "").strip()
+        html = item.findtext("content:encoded", default="", namespaces=ns) or ""
+        html = unescape(html)
+        m = re.search(r"https://i\.redd\.it/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)", html, re.IGNORECASE)
+        if not m:
+            continue
+        img = m.group(0)
+        items.append({
+            "title": title,
+            "image_url": img,
+            "permalink": permalink,
+            "author": "u/unknown",
+            "ups": 0, "num_comments": 0, "awards": 0, "upvote_ratio": 0.0,
+            "score_interaction": 0  # no scoring data via RSS
+        })
+        if len(items) >= max(1, limit):
+            break
+    return items
+
+def get_candidates_with_fallback(sub: str, limit: int) -> list[dict]:
+    """
+    Try JSON → old JSON → RSS; return ranked candidates if JSON works,
+    else RSS-ordered items.
+    """
+    try:
+        data = fetch_hot_json_primary(sub, limit)
+        return image_candidates_with_interactions(data)
+    except requests.HTTPError as e:
+        if getattr(e, "response", None) and e.response is not None and e.response.status_code == 403:
+            logging.warning("Reddit 403 on primary JSON; retrying old.reddit.com …")
+            try:
+                data = fetch_hot_json_old(sub, limit)
+                return image_candidates_with_interactions(data)
+            except requests.HTTPError as e2:
+                if getattr(e2, "response", None) and e2.response is not None and e2.response.status_code == 403:
+                    logging.warning("Reddit 403 on old JSON; falling back to RSS …")
+                    return fetch_hot_rss(sub, limit)
+                raise
+        raise
 
 # ── Reddit fetch ──────────────────────────────────────────────────────────────
 def fetch_hot_json(sub: str, limit: int) -> dict:
@@ -234,8 +313,8 @@ def ig_publish(creation_id: str) -> str:
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
     logging.info(f"[Step 1] Fetching top {LIMIT} hot posts from r/{SUBREDDIT} …")
-    data = fetch_hot_json(SUBREDDIT, LIMIT)
-    candidates = image_candidates_with_interactions(data)
+    candidates = get_candidates_with_fallback(SUBREDDIT, LIMIT)
+
 
     if not candidates:
         logging.error("No suitable image posts found.")
