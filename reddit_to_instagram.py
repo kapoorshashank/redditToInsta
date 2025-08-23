@@ -21,6 +21,8 @@ from xml.etree import ElementTree as ET
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import base64
+import random
+
 
 import requests
 
@@ -483,6 +485,13 @@ def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
 
 # ─────────────────────── Main ────────────────────────────────
 def main(dry_run: bool = False):
+    # Randomize start to avoid looking botty. Default: up to 30 minutes.
+    jitter_max = int(os.getenv("JITTER_MAX_SECONDS", "1800"))  # 1800s = 30 min
+    if jitter_max > 0 and not os.getenv("DISABLE_JITTER"):
+        jitter = random.randint(0, jitter_max)
+        logging.info(f"Jittering start by {jitter} seconds to randomize within window.")
+        time.sleep(jitter)
+
     if dry_run:
         logging.info("** DRY RUN enabled: will NOT publish to Instagram **")
 
