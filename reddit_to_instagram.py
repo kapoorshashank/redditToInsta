@@ -42,6 +42,20 @@ GRAPH_BASE = "https://graph.facebook.com/v21.0"
 ALLOWED_IMG_HOSTS = ("i.redd.it", "preview.redd.it", "i.imgur.com", "i.stack.imgur.com", "i.reddituploads.com")
 
 
+# JSON-via-proxy getter to bypass Cloudflare/403
+def fetch_json_via_jina(listing_url: str) -> Dict[str, Any]:
+    """
+    Fetch a Reddit JSON listing via r.jina.ai proxy to bypass Cloudflare/403.
+    listing_url should be like: https://www.reddit.com/r/<sub>/hot.json?limit=8
+    """
+    proxy = "https://r.jina.ai/http://"
+    # strip scheme for the proxy join
+    stripped = listing_url.replace("https://", "").replace("http://", "")
+    url = proxy + stripped
+    r = _req(url, "application/json; charset=utf-8", timeout=25)
+    # r.jina.ai returns text/plain sometimes; parse as JSON robustly
+    return json.loads(r.text)
+
 log_filename = os.path.join(LOG_DIR, f"run_{datetime.now().strftime('%Y-%m-%d')}.log")
 logging.basicConfig(
     filename=log_filename,
@@ -296,21 +310,40 @@ def fetch_hot_from_mirror(sub: str, limit: int) -> List[Dict[str, Any]]:
 
 
 def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def best_image_url(p: Dict[str, Any]) -> Optional[str]:
+        # 1) direct url_overridden_by_dest / url
+        u = p.get("url_overridden_by_dest") or p.get("url") or ""
+        if isinstance(u, str) and u:
+            if _is_allowed_image(u):
+                return _normalize_preview(u)
+
+        # 2) preview.images[].source.url (HTML-escaped)
+        prev = p.get("preview", {})
+        imgs = prev.get("images") or []
+        for im in imgs:
+            src = (im.get("source") or {}).get("url")
+            if not src: 
+                continue
+            src = unescape(src)
+            # convert protocol-relative // to https:
+            if src.startswith("//"):
+                src = "https:" + src
+            if _is_allowed_image(src):
+                return _normalize_preview(src)
+
+        return None
+
     items: List[Dict[str, Any]] = []
     for child in data.get("data", {}).get("children", []):
         p = child.get("data", {}) or {}
-        url = p.get("url_overridden_by_dest") or p.get("url") or ""
-        if not isinstance(url, str) or not url:
-            continue
-        if not any(url.split("/")[2].lower().endswith(h) for h in ALLOWED_IMG_HOSTS):
-            continue
-        if not re.search(r"\.(jpg|jpeg|png)(\?|$)", url, re.IGNORECASE):
-            continue
         if p.get("over_18") or p.get("stickied"):
             continue
 
-        url = _normalize_preview(url)
+        img = best_image_url(p)
+        if not img:
+            continue
 
+        # metrics (may be missing in proxy JSON; default to 0)
         ups = int(p.get("ups") or p.get("score") or 0)
         comments = int(p.get("num_comments") or 0)
         awards = int(p.get("total_awards_received") or 0)
@@ -320,14 +353,11 @@ def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, A
 
         items.append({
             "title": p.get("title", ""),
-            "image_url": url,
+            "image_url": img,
             "permalink": f"https://reddit.com{p.get('permalink', '')}",
             "author": f"u/{p.get('author')}" if p.get("author") else "u/unknown",
-            "ups": ups,
-            "num_comments": comments,
-            "awards": awards,
-            "upvote_ratio": ratio,
-            "score_interaction": score,
+            "ups": ups, "num_comments": comments, "awards": awards,
+            "upvote_ratio": ratio, "score_interaction": score,
         })
 
     items.sort(key=lambda x: x["score_interaction"], reverse=True)
@@ -353,7 +383,7 @@ def _find_first_image_in_html(html: str) -> Optional[str]:
 
 
 def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
-    # JSON
+    # 1) Primary JSON
     try:
         data = fetch_hot_json(sub, limit)
         items = image_candidates_with_interactions(data)
@@ -363,17 +393,33 @@ def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
     except Exception as e:
         logging.warning(f"Primary JSON failed: {e}")
 
-    # old JSON
+    # 2) old.reddit JSON
     try:
         data = fetch_hot_json_old(sub, limit)
         items = image_candidates_with_interactions(data)
         if items: return items
     except ForbiddenError:
-        logging.warning("Reddit 403 on old JSON; falling back to RSS …")
+        logging.warning("Reddit 403 on old JSON; trying r.jina.ai proxy …")
     except Exception as e:
         logging.warning(f"Old JSON failed: {e}")
 
-    # RSS
+    # 3) JSON via r.jina.ai proxy (hot → new → top day)
+    json_urls = [
+        f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}",
+        f"https://www.reddit.com/r/{sub}/new.json?limit={limit}",
+        f"https://www.reddit.com/r/{sub}/top.json?t=day&limit={limit}",
+    ]
+    for ju in json_urls:
+        try:
+            pdata = fetch_json_via_jina(ju)
+            items = image_candidates_with_interactions(pdata)
+            if items:
+                logging.info("Using JSON via r.jina.ai proxy.")
+                return items
+        except Exception as e:
+            logging.warning(f"Proxy JSON failed for {ju}: {e}")
+
+    # 4) RSS (multi feeds)
     try:
         items = fetch_hot_rss(sub, limit)
         if items: return items
@@ -381,11 +427,11 @@ def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
     except Exception as e:
         logging.warning(f"RSS failed: {e}; trying mirror …")
 
-    # Mirror
+    # 5) Mirror pages
     items = fetch_hot_from_mirror(sub, limit)
     if items: return items
 
-    raise RuntimeError("Could not collect any usable image links from Reddit (JSON/RSS/mirror).")
+    raise RuntimeError("Could not collect any usable image links from Reddit (JSON/proxy/RSS/mirror).")
 
 # ---------------- Main --------------------
 def main():
