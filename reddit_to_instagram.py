@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Reddit → Instagram (Top 8, public) + IG Graph (no captions), CI-safe
-- JSON → old JSON → RSS → mirror (jina) fallbacks
-- Accepts i.redd.it, preview.redd.it, i.imgur.com
-- Normalizes preview.redd.it → i.redd.it where possible
-- Logs + history next to the script
+Reddit → Instagram (no captions), CI-safe
+- Reliable: uses Reddit OAuth (client_id/secret) on GitHub Actions to bypass 403
+- If OAuth not provided, falls back to JSON → old JSON → JSON via r.jina.ai → RSS → mirror
+- Accepts i.redd.it, preview.redd.it, i.imgur.com, i.stack.imgur.com, i.reddituploads.com
+- Logs + posted history next to this file
 """
 
 import os
@@ -17,20 +17,17 @@ from html import unescape
 from xml.etree import ElementTree as ET
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import base64
 
 import requests
 
+# ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 HISTORY_FILE = os.path.join(BASE_DIR, "posted_history.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# A more "real" UA helps in CI
-REDDIT_UA = os.getenv(
-    "REDDIT_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RedditToInstaBot/1.1 (+https://github.com/youruser/yourrepo)"
-)
-
+# ── Config (env) ──────────────────────────────────────────────────────────────
 SUBREDDIT = os.getenv("SUBREDDIT", "ProgrammerHumor")
 LIMIT = int(os.getenv("REDDIT_LIMIT", "8"))
 
@@ -38,24 +35,26 @@ IG_USER_ID = os.getenv("IG_USER_ID")
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
 
-# Accept these image hosts
-ALLOWED_IMG_HOSTS = ("i.redd.it", "preview.redd.it", "i.imgur.com", "i.stack.imgur.com", "i.reddituploads.com")
+# Optional Reddit OAuth (RECOMMENDED for CI)
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 
+# A more "real" UA helps in CI runners
+REDDIT_UA = os.getenv(
+    "REDDIT_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RedditToInstaBot/2.0 (+https://github.com/youruser/yourrepo)"
+)
 
-# JSON-via-proxy getter to bypass Cloudflare/403
-def fetch_json_via_jina(listing_url: str) -> Dict[str, Any]:
-    """
-    Fetch a Reddit JSON listing via r.jina.ai proxy to bypass Cloudflare/403.
-    listing_url should be like: https://www.reddit.com/r/<sub>/hot.json?limit=8
-    """
-    proxy = "https://r.jina.ai/http://"
-    # strip scheme for the proxy join
-    stripped = listing_url.replace("https://", "").replace("http://", "")
-    url = proxy + stripped
-    r = _req(url, "application/json; charset=utf-8", timeout=25)
-    # r.jina.ai returns text/plain sometimes; parse as JSON robustly
-    return json.loads(r.text)
+# Allow these direct image hosts
+ALLOWED_IMG_HOSTS = (
+    "i.redd.it",
+    "preview.redd.it",
+    "i.imgur.com",
+    "i.stack.imgur.com",
+    "i.reddituploads.com",
+)
 
+# ── Logging ───────────────────────────────────────────────────────────────────
 log_filename = os.path.join(LOG_DIR, f"run_{datetime.now().strftime('%Y-%m-%d')}.log")
 logging.basicConfig(
     filename=log_filename,
@@ -67,6 +66,7 @@ _console.setLevel(logging.INFO)
 _console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logging.getLogger().addHandler(_console)
 
+# ── Optional .env load ────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
@@ -79,10 +79,10 @@ def require_env(var: str):
         logging.error(f"Missing required environment variable: {var}")
         sys.exit(1)
 
-for var in ["IG_USER_ID", "IG_ACCESS_TOKEN"]:
-    require_env(var)
+for _v in ("IG_USER_ID", "IG_ACCESS_TOKEN"):
+    require_env(_v)
 
-# ---------------- History ----------------
+# ── History helpers ───────────────────────────────────────────────────────────
 def load_history() -> List[dict]:
     if not os.path.exists(HISTORY_FILE):
         return []
@@ -98,7 +98,7 @@ def save_history(history: List[dict]):
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        logging.error(f"Failed to save history: {e}")
+        logging.error(f"Failed to save history file: {e}")
 
 def already_posted(image_url: str, history: List[dict]) -> bool:
     return any(entry.get("image_url") == image_url for entry in history)
@@ -113,7 +113,7 @@ def add_to_history(image_url: str, reddit_permalink: str, media_id: str):
     })
     save_history(history)
 
-# ------------- Graph helpers --------------
+# ── Graph helpers ─────────────────────────────────────────────────────────────
 def log_usage_headers(resp: requests.Response, label: str):
     for h in ("x-app-usage", "x-page-usage", "x-business-use-case-usage"):
         v = resp.headers.get(h)
@@ -183,20 +183,21 @@ def ig_publish(creation_id: str) -> str:
         raise RuntimeError(f"IG: missing media id in response: {data}")
     return media_id
 
-# ------------- Reddit helpers -------------
-class ForbiddenError(Exception): pass
+# ── Reddit helpers ────────────────────────────────────────────────────────────
+class ForbiddenError(Exception):
+    """Raised when Reddit returns 403 so we can fall back cleanly."""
+    pass
 
-def _req(url: str, accept: str, timeout: int = 20) -> requests.Response:
-    r = requests.get(
-        url,
-        headers={
-            "User-Agent": REDDIT_UA,
-            "Accept": accept,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-        },
-        timeout=timeout,
-    )
+def _req(url: str, accept: str, timeout: int = 20, extra_headers: Optional[dict] = None) -> requests.Response:
+    headers = {
+        "User-Agent": REDDIT_UA,
+        "Accept": accept,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    r = requests.get(url, headers=headers, timeout=timeout)
     if r.status_code == 403:
         raise ForbiddenError(f"403 from {url}")
     r.raise_for_status()
@@ -212,16 +213,59 @@ def _is_allowed_image(url: str) -> bool:
     return bool(re.search(r"\.(jpg|jpeg|png)(\?|$)", url, re.IGNORECASE))
 
 def _normalize_preview(url: str) -> str:
-    # Convert preview.redd.it → i.redd.it when possible
     try:
         host = url.split("/")[2].lower()
+        core = url.split("?")[0]
         if host.startswith("preview.redd.it"):
-            core = url.split("?")[0]
             return core.replace("//preview.", "//i.")
+        return core
     except Exception:
-        pass
-    return url
+        return url
 
+def _find_first_image_in_html(html: str) -> Optional[str]:
+    if not html:
+        return None
+    for m in re.finditer(
+        r'(?:https?:)?//[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)(?:\?[^\s"<>)]*)?',
+        html, re.IGNORECASE
+    ):
+        url = m.group(0)
+        if url.startswith("//"):
+            url = "https:" + url
+        if _is_allowed_image(url):
+            return _normalize_preview(url)
+    return None
+
+# ---------- OAuth path (RECOMMENDED) ----------
+def reddit_oauth_token() -> Optional[str]:
+    """App-only OAuth (client credentials) for public read."""
+    if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        return None
+    token_url = "https://www.reddit.com/api/v1/access_token"
+    auth = base64.b64encode(f"{REDDIT_CLIENT_ID}:{REDDIT_CLIENT_SECRET}".encode()).decode()
+    headers = {
+        "User-Agent": REDDIT_UA,
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    data = {"grant_type": "client_credentials", "duration": "temporary"}
+    r = requests.post(token_url, headers=headers, data=data, timeout=20)
+    if r.status_code != 200:
+        logging.warning(f"Reddit OAuth failed: {r.status_code} {r.text[:200]}")
+        return None
+    tok = r.json().get("access_token")
+    return tok
+
+def fetch_hot_oauth(sub: str, limit: int, access_token: str) -> Dict[str, Any]:
+    url = f"https://oauth.reddit.com/r/{sub}/hot?limit={limit}"
+    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": REDDIT_UA}
+    r = requests.get(url, headers=headers, timeout=20)
+    if r.status_code == 403:
+        raise ForbiddenError("403 from OAuth endpoint")
+    r.raise_for_status()
+    return r.json()
+
+# ---------- Public paths (fallback only) ----------
 def fetch_hot_json(sub: str, limit: int) -> Dict[str, Any]:
     url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
     return _req(url, "application/json").json()
@@ -230,10 +274,14 @@ def fetch_hot_json_old(sub: str, limit: int) -> Dict[str, Any]:
     url = f"https://old.reddit.com/r/{sub}/hot.json?limit={limit}"
     return _req(url, "application/json").json()
 
+def fetch_json_via_jina(listing_url: str) -> Dict[str, Any]:
+    proxy = "https://r.jina.ai/http://"
+    stripped = listing_url.replace("https://", "").replace("http://", "")
+    url = proxy + stripped
+    r = _req(url, "application/json; charset=utf-8", timeout=25)
+    return json.loads(r.text)
+
 def fetch_hot_rss(sub: str, limit: int) -> List[Dict[str, Any]]:
-    """
-    Try multiple RSS feeds (hot/new/top?=day) and accept protocol-relative URLs.
-    """
     feeds = [
         f"https://www.reddit.com/r/{sub}/hot/.rss",
         f"https://www.reddit.com/r/{sub}/new/.rss",
@@ -267,11 +315,7 @@ def fetch_hot_rss(sub: str, limit: int) -> List[Dict[str, Any]]:
             logging.warning(f"RSS fetch failed for {url}: {e}")
     return items
 
-
 def fetch_hot_from_mirror(sub: str, limit: int) -> List[Dict[str, Any]]:
-    """
-    Last resort: use r.jina.ai to read old Reddit pages (hot/new/top?=day) and extract images.
-    """
     pages = [
         f"https://r.jina.ai/http://old.reddit.com/r/{sub}/hot/",
         f"https://r.jina.ai/http://old.reddit.com/r/{sub}/new/",
@@ -283,8 +327,10 @@ def fetch_hot_from_mirror(sub: str, limit: int) -> List[Dict[str, Any]]:
     for url in pages:
         try:
             text = _req(url, "text/plain").text
-            for m in re.finditer(r'(?:https?:)?//[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)(?:\?[^\s"<>)]*)?',
-                                 text, re.IGNORECASE):
+            for m in re.finditer(
+                r'(?:https?:)?//[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)(?:\?[^\s"<>)]*)?',
+                text, re.IGNORECASE
+            ):
                 img = m.group(0)
                 if img.startswith("//"):
                     img = "https:" + img
@@ -308,29 +354,23 @@ def fetch_hot_from_mirror(sub: str, limit: int) -> List[Dict[str, Any]]:
             logging.warning(f"Mirror fetch failed for {url}: {e}")
     return items
 
-
+# ---------- Candidate extraction ----------
 def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     def best_image_url(p: Dict[str, Any]) -> Optional[str]:
-        # 1) direct url_overridden_by_dest / url
         u = p.get("url_overridden_by_dest") or p.get("url") or ""
-        if isinstance(u, str) and u:
-            if _is_allowed_image(u):
-                return _normalize_preview(u)
-
-        # 2) preview.images[].source.url (HTML-escaped)
+        if isinstance(u, str) and u and _is_allowed_image(u):
+            return _normalize_preview(u)
         prev = p.get("preview", {})
         imgs = prev.get("images") or []
         for im in imgs:
             src = (im.get("source") or {}).get("url")
-            if not src: 
+            if not src:
                 continue
             src = unescape(src)
-            # convert protocol-relative // to https:
             if src.startswith("//"):
                 src = "https:" + src
             if _is_allowed_image(src):
                 return _normalize_preview(src)
-
         return None
 
     items: List[Dict[str, Any]] = []
@@ -338,19 +378,16 @@ def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, A
         p = child.get("data", {}) or {}
         if p.get("over_18") or p.get("stickied"):
             continue
-
         img = best_image_url(p)
         if not img:
             continue
 
-        # metrics (may be missing in proxy JSON; default to 0)
         ups = int(p.get("ups") or p.get("score") or 0)
         comments = int(p.get("num_comments") or 0)
         awards = int(p.get("total_awards_received") or 0)
         ratio = float(p.get("upvote_ratio") or 0.0)
 
         score = ups + 2 * comments + 10 * awards + int(ups * max(0.0, (ratio - 0.85)) * 2)
-
         items.append({
             "title": p.get("title", ""),
             "image_url": img,
@@ -363,26 +400,19 @@ def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, A
     items.sort(key=lambda x: x["score_interaction"], reverse=True)
     return items
 
-def _find_first_image_in_html(html: str) -> Optional[str]:
-    """
-    Find first allowed image URL in an HTML snippet.
-    Handles protocol-relative URLs like //preview.redd.it/...
-    Returns normalized https URL or None.
-    """
-    if not html:
-        return None
-    # match https://... OR //...
-    for m in re.finditer(r'(?:https?:)?//[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)(?:\?[^\s"<>)]*)?',
-                         html, re.IGNORECASE):
-        url = m.group(0)
-        if url.startswith("//"):
-            url = "https:" + url
-        if _is_allowed_image(url):
-            return _normalize_preview(url)
-    return None
-
-
 def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
+    # 0) OAuth path
+    tok = reddit_oauth_token()
+    if tok:
+        try:
+            data = fetch_hot_oauth(sub, limit, tok)
+            items = image_candidates_with_interactions(data)
+            if items:
+                logging.info("Using Reddit OAuth (client credentials).")
+                return items
+        except Exception as e:
+            logging.warning(f"OAuth fetch failed: {e}; falling back to public paths.")
+
     # 1) Primary JSON
     try:
         data = fetch_hot_json(sub, limit)
@@ -403,7 +433,7 @@ def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
     except Exception as e:
         logging.warning(f"Old JSON failed: {e}")
 
-    # 3) JSON via r.jina.ai proxy (hot → new → top day)
+    # 3) JSON via proxy (hot/new/top day)
     json_urls = [
         f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}",
         f"https://www.reddit.com/r/{sub}/new.json?limit={limit}",
@@ -431,9 +461,9 @@ def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
     items = fetch_hot_from_mirror(sub, limit)
     if items: return items
 
-    raise RuntimeError("Could not collect any usable image links from Reddit (JSON/proxy/RSS/mirror).")
+    raise RuntimeError("Could not collect any usable image links from Reddit (OAuth/JSON/proxy/RSS/mirror).")
 
-# ---------------- Main --------------------
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     logging.info(f"[Step 1] Fetching top {LIMIT} hot posts from r/{SUBREDDIT} …")
     candidates = get_candidates_with_fallback(SUBREDDIT, LIMIT)
