@@ -48,6 +48,8 @@ jobs:
           REDDIT_LIMIT: ${{ secrets.REDDIT_LIMIT }}
           FB_APP_ID: ${{ secrets.FB_APP_ID }}
           FB_APP_SECRET: ${{ secrets.FB_APP_SECRET }}
+          REDDIT_CLIENT_ID:     ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         run: |
           python reddit_to_instagram.py
           echo "== Logs =="
