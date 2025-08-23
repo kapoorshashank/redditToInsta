@@ -39,7 +39,8 @@ IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
 
 # Accept these image hosts
-ALLOWED_IMG_HOSTS = ("i.redd.it", "preview.redd.it", "i.imgur.com", "i.stack.imgur.com")
+ALLOWED_IMG_HOSTS = ("i.redd.it", "preview.redd.it", "i.imgur.com", "i.stack.imgur.com", "i.reddituploads.com")
+
 
 log_filename = os.path.join(LOG_DIR, f"run_{datetime.now().strftime('%Y-%m-%d')}.log")
 logging.basicConfig(
@@ -216,60 +217,83 @@ def fetch_hot_json_old(sub: str, limit: int) -> Dict[str, Any]:
     return _req(url, "application/json").json()
 
 def fetch_hot_rss(sub: str, limit: int) -> List[Dict[str, Any]]:
-    url = f"https://www.reddit.com/r/{sub}/hot/.rss"
-    text = _req(url, "application/rss+xml").text
-    root = ET.fromstring(text)
-    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+    """
+    Try multiple RSS feeds (hot/new/top?=day) and accept protocol-relative URLs.
+    """
+    feeds = [
+        f"https://www.reddit.com/r/{sub}/hot/.rss",
+        f"https://www.reddit.com/r/{sub}/new/.rss",
+        f"https://www.reddit.com/r/{sub}/top/.rss?t=day",
+    ]
     items: List[Dict[str, Any]] = []
-    for item in root.findall("./channel/item"):
-        title = (item.findtext("title") or "").strip()
-        permalink = (item.findtext("link") or "").strip()
-        html = unescape(item.findtext("content:encoded", default="", namespaces=ns) or "")
-        # Look for allowed hosts
-        for m in re.finditer(r"https://[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)\S*", html, re.IGNORECASE):
-            img = m.group(0)
-            if _is_allowed_image(img):
+    ns = {"content": "http://purl.org/rss/1.0/modules/content/"}
+
+    for url in feeds:
+        try:
+            text = _req(url, "application/rss+xml").text
+            root = ET.fromstring(text)
+            for item in root.findall("./channel/item"):
+                title = (item.findtext("title") or "").strip()
+                permalink = (item.findtext("link") or "").strip()
+                html = unescape(item.findtext("content:encoded", default="", namespaces=ns) or "")
+                img = _find_first_image_in_html(html)
+                if not img:
+                    continue
                 items.append({
                     "title": title,
-                    "image_url": _normalize_preview(img),
+                    "image_url": img,
                     "permalink": permalink,
                     "author": "u/unknown",
                     "ups": 0, "num_comments": 0, "awards": 0, "upvote_ratio": 0.0,
                     "score_interaction": 0
                 })
-                break  # one image per item is enough
-        if len(items) >= max(1, limit):
-            break
+                if len(items) >= max(1, limit):
+                    return items
+        except Exception as e:
+            logging.warning(f"RSS fetch failed for {url}: {e}")
     return items
+
 
 def fetch_hot_from_mirror(sub: str, limit: int) -> List[Dict[str, Any]]:
     """
-    As a last resort, read a text mirror of the subreddit page via r.jina.ai to extract image links.
+    Last resort: use r.jina.ai to read old Reddit pages (hot/new/top?=day) and extract images.
     """
-    url = f"https://r.jina.ai/http://old.reddit.com/r/{sub}/hot/"
-    text = _req(url, "text/plain").text
+    pages = [
+        f"https://r.jina.ai/http://old.reddit.com/r/{sub}/hot/",
+        f"https://r.jina.ai/http://old.reddit.com/r/{sub}/new/",
+        f"https://r.jina.ai/http://old.reddit.com/r/{sub}/top/?t=day",
+    ]
     items: List[Dict[str, Any]] = []
     seen = set()
-    # Find lines that look like posts then scan for images nearby; simplified approach:
-    for m in re.finditer(r"https://[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)\S*", text, re.IGNORECASE):
-        img = m.group(0)
-        if not _is_allowed_image(img):
-            continue
-        img = _normalize_preview(img)
-        if img in seen:
-            continue
-        seen.add(img)
-        items.append({
-            "title": "(mirror)",
-            "image_url": img,
-            "permalink": f"https://www.reddit.com/r/{sub}/hot/",
-            "author": "u/unknown",
-            "ups": 0, "num_comments": 0, "awards": 0, "upvote_ratio": 0.0,
-            "score_interaction": 0
-        })
-        if len(items) >= max(1, limit):
-            break
+
+    for url in pages:
+        try:
+            text = _req(url, "text/plain").text
+            for m in re.finditer(r'(?:https?:)?//[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)(?:\?[^\s"<>)]*)?',
+                                 text, re.IGNORECASE):
+                img = m.group(0)
+                if img.startswith("//"):
+                    img = "https:" + img
+                if not _is_allowed_image(img):
+                    continue
+                img = _normalize_preview(img)
+                if img in seen:
+                    continue
+                seen.add(img)
+                items.append({
+                    "title": "(mirror)",
+                    "image_url": img,
+                    "permalink": f"https://www.reddit.com/r/{sub}/",
+                    "author": "u/unknown",
+                    "ups": 0, "num_comments": 0, "awards": 0, "upvote_ratio": 0.0,
+                    "score_interaction": 0
+                })
+                if len(items) >= max(1, limit):
+                    return items
+        except Exception as e:
+            logging.warning(f"Mirror fetch failed for {url}: {e}")
     return items
+
 
 def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
@@ -308,6 +332,25 @@ def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, A
 
     items.sort(key=lambda x: x["score_interaction"], reverse=True)
     return items
+
+def _find_first_image_in_html(html: str) -> Optional[str]:
+    """
+    Find first allowed image URL in an HTML snippet.
+    Handles protocol-relative URLs like //preview.redd.it/...
+    Returns normalized https URL or None.
+    """
+    if not html:
+        return None
+    # match https://... OR //...
+    for m in re.finditer(r'(?:https?:)?//[a-z0-9.-]+/[A-Za-z0-9_./-]+\.(?:jpg|jpeg|png)(?:\?[^\s"<>)]*)?',
+                         html, re.IGNORECASE):
+        url = m.group(0)
+        if url.startswith("//"):
+            url = "https:" + url
+        if _is_allowed_image(url):
+            return _normalize_preview(url)
+    return None
+
 
 def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
     # JSON
