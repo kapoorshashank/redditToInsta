@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Reddit → Instagram (no captions), CI-safe
-- Reliable: uses Reddit OAuth (client_id/secret) on GitHub Actions to bypass 403
-- If OAuth not provided, falls back to JSON → old JSON → JSON via r.jina.ai → RSS → mirror
-- Accepts i.redd.it, preview.redd.it, i.imgur.com, i.stack.imgur.com, i.reddituploads.com
-- Logs + posted history next to this file
+Reddit → Instagram (no captions), CI-safe + Local-friendly
+- Uses Reddit OAuth (client_id/secret) to bypass 403s on CI.
+- Falls back to public paths if OAuth unavailable: JSON → old JSON → JSON via r.jina.ai → RSS (hot/new/top) → mirror.
+- Accepts image hosts: i.redd.it, preview.redd.it, i.imgur.com, i.stack.imgur.com, i.reddituploads.com.
+- Normalizes preview.redd.it → i.redd.it where possible.
+- Logs to logs/run_YYYY-MM-DD.log and stores posted_history.json next to this file.
+- Add --dry-run to test (fetch + pick) without publishing to Instagram.
 """
 
 import os
@@ -13,6 +15,7 @@ import time
 import json
 import logging
 import re
+import argparse
 from html import unescape
 from xml.etree import ElementTree as ET
 from typing import List, Dict, Any, Optional
@@ -21,13 +24,13 @@ import base64
 
 import requests
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
+# ───────────────────────── Base paths ─────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 HISTORY_FILE = os.path.join(BASE_DIR, "posted_history.json")
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# ── Config (env) ──────────────────────────────────────────────────────────────
+# ───────────────────────── Config (env) ───────────────────────
 SUBREDDIT = os.getenv("SUBREDDIT", "ProgrammerHumor")
 LIMIT = int(os.getenv("REDDIT_LIMIT", "8"))
 
@@ -35,17 +38,17 @@ IG_USER_ID = os.getenv("IG_USER_ID")
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 GRAPH_BASE = "https://graph.facebook.com/v21.0"
 
-# Optional Reddit OAuth (RECOMMENDED for CI)
+# Reddit OAuth (RECOMMENDED)
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET")
 
-# A more "real" UA helps in CI runners
+# A more "real" UA helps in CI/local
 REDDIT_UA = os.getenv(
     "REDDIT_USER_AGENT",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RedditToInstaBot/2.0 (+https://github.com/youruser/yourrepo)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RedditToInstaBot/2.1 (+https://github.com/youruser/yourrepo)"
 )
 
-# Allow these direct image hosts
+# Allowed direct image hosts
 ALLOWED_IMG_HOSTS = (
     "i.redd.it",
     "preview.redd.it",
@@ -54,7 +57,7 @@ ALLOWED_IMG_HOSTS = (
     "i.reddituploads.com",
 )
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+# ───────────────────────── Logging ────────────────────────────
 log_filename = os.path.join(LOG_DIR, f"run_{datetime.now().strftime('%Y-%m-%d')}.log")
 logging.basicConfig(
     filename=log_filename,
@@ -66,7 +69,7 @@ _console.setLevel(logging.INFO)
 _console.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logging.getLogger().addHandler(_console)
 
-# ── Optional .env load ────────────────────────────────────────────────────────
+# ─────────────────────── Optional .env load ───────────────────
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv(dotenv_path=os.path.join(BASE_DIR, ".env"))
@@ -79,10 +82,14 @@ def require_env(var: str):
         logging.error(f"Missing required environment variable: {var}")
         sys.exit(1)
 
-for _v in ("IG_USER_ID", "IG_ACCESS_TOKEN"):
-    require_env(_v)
+# IG creds are required (we can still dry-run without them via flag)
+def ensure_ig_env(skip_ig: bool):
+    if skip_ig:
+        return
+    for _v in ("IG_USER_ID", "IG_ACCESS_TOKEN"):
+        require_env(_v)
 
-# ── History helpers ───────────────────────────────────────────────────────────
+# ─────────────────────── History helpers ──────────────────────
 def load_history() -> List[dict]:
     if not os.path.exists(HISTORY_FILE):
         return []
@@ -113,7 +120,7 @@ def add_to_history(image_url: str, reddit_permalink: str, media_id: str):
     })
     save_history(history)
 
-# ── Graph helpers ─────────────────────────────────────────────────────────────
+# ─────────────── Instagram Graph helpers ──────────────────────
 def log_usage_headers(resp: requests.Response, label: str):
     for h in ("x-app-usage", "x-page-usage", "x-business-use-case-usage"):
         v = resp.headers.get(h)
@@ -183,7 +190,7 @@ def ig_publish(creation_id: str) -> str:
         raise RuntimeError(f"IG: missing media id in response: {data}")
     return media_id
 
-# ── Reddit helpers ────────────────────────────────────────────────────────────
+# ─────────────── Reddit helpers (network) ─────────────────────
 class ForbiddenError(Exception):
     """Raised when Reddit returns 403 so we can fall back cleanly."""
     pass
@@ -236,25 +243,36 @@ def _find_first_image_in_html(html: str) -> Optional[str]:
             return _normalize_preview(url)
     return None
 
-# ---------- OAuth path (RECOMMENDED) ----------
+# ─────────────── Reddit: OAuth path (preferred) ──────────────
 def reddit_oauth_token() -> Optional[str]:
-    """App-only OAuth (client credentials) for public read."""
+    """App-only OAuth for public read. Requires REDDIT_CLIENT_ID/SECRET."""
     if not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET:
+        logging.info("Reddit OAuth not configured (missing REDDIT_CLIENT_ID/SECRET).")
         return None
     token_url = "https://www.reddit.com/api/v1/access_token"
-    auth = base64.b64encode(f"{REDDIT_CLIENT_ID}:{REDDIT_CLIENT_SECRET}".encode()).decode()
-    headers = {
-        "User-Agent": REDDIT_UA,
-        "Authorization": f"Basic {auth}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    data = {"grant_type": "client_credentials", "duration": "temporary"}
-    r = requests.post(token_url, headers=headers, data=data, timeout=20)
-    if r.status_code != 200:
-        logging.warning(f"Reddit OAuth failed: {r.status_code} {r.text[:200]}")
+    headers = {"User-Agent": REDDIT_UA}
+    data = {"grant_type": "client_credentials", "scope": "read"}
+    try:
+        r = requests.post(
+            token_url,
+            auth=(REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET),
+            data=data,
+            headers=headers,
+            timeout=25,
+        )
+        if r.status_code != 200:
+            logging.warning(f"Reddit OAuth failed: {r.status_code} {r.text[:300]}")
+            return None
+        j = r.json()
+        tok = j.get("access_token")
+        if not tok:
+            logging.warning(f"Reddit OAuth response missing access_token: {j}")
+            return None
+        logging.info("Reddit OAuth token acquired.")
+        return tok
+    except Exception as e:
+        logging.warning(f"Reddit OAuth exception: {e}")
         return None
-    tok = r.json().get("access_token")
-    return tok
 
 def fetch_hot_oauth(sub: str, limit: int, access_token: str) -> Dict[str, Any]:
     url = f"https://oauth.reddit.com/r/{sub}/hot?limit={limit}"
@@ -265,7 +283,7 @@ def fetch_hot_oauth(sub: str, limit: int, access_token: str) -> Dict[str, Any]:
     r.raise_for_status()
     return r.json()
 
-# ---------- Public paths (fallback only) ----------
+# ─────────────── Reddit: public paths (fallback) ─────────────
 def fetch_hot_json(sub: str, limit: int) -> Dict[str, Any]:
     url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
     return _req(url, "application/json").json()
@@ -354,7 +372,7 @@ def fetch_hot_from_mirror(sub: str, limit: int) -> List[Dict[str, Any]]:
             logging.warning(f"Mirror fetch failed for {url}: {e}")
     return items
 
-# ---------- Candidate extraction ----------
+# ───────────── Candidate extraction/ranking ────────────────
 def image_candidates_with_interactions(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     def best_image_url(p: Dict[str, Any]) -> Optional[str]:
         u = p.get("url_overridden_by_dest") or p.get("url") or ""
@@ -463,8 +481,14 @@ def get_candidates_with_fallback(sub: str, limit: int) -> List[Dict[str, Any]]:
 
     raise RuntimeError("Could not collect any usable image links from Reddit (OAuth/JSON/proxy/RSS/mirror).")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
+# ─────────────────────── Main ────────────────────────────────
+def main(dry_run: bool = False):
+    if dry_run:
+        logging.info("** DRY RUN enabled: will NOT publish to Instagram **")
+
+    # If not dry-run, confirm IG env present
+    ensure_ig_env(skip_ig=dry_run)
+
     logging.info(f"[Step 1] Fetching top {LIMIT} hot posts from r/{SUBREDDIT} …")
     candidates = get_candidates_with_fallback(SUBREDDIT, LIMIT)
     if not candidates:
@@ -482,6 +506,10 @@ def main():
         f"awards={pick['awards']}, ratio={pick['upvote_ratio']:.2f})"
     )
     logging.info(f"[Pick] URL: {pick['image_url']}  | Permalink: {pick['permalink']}")
+
+    if dry_run:
+        logging.info("DRY RUN: skipping IG upload. Exiting.")
+        return
 
     logging.info("[Step 2] Creating Instagram container …")
     creation_id = ig_create_container(pick["image_url"])
@@ -501,8 +529,12 @@ def main():
     logging.info("History updated.")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Reddit → Instagram (no captions)")
+    parser.add_argument("--dry-run", action="store_true", help="Fetch & pick only; do NOT publish to Instagram")
+    args = parser.parse_args()
+
     try:
-        main()
+        main(dry_run=args.dry_run)
         logging.info("✅ Script finished successfully.")
     except Exception:
         logging.exception("❌ Script failed with error")
